@@ -1,0 +1,152 @@
+import os
+
+# Set environment variables BEFORE importing torch, transformers, diffusers, requests, or runpod
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HOME"] = "/app/cache"
+os.environ["HF_HUB_CACHE"] = "/app/cache/huggingface/hub"
+os.environ["TRANSFORMERS_CACHE"] = "/app/cache/huggingface/transformers"
+os.environ["DIFFUSERS_CACHE"] = "/app/cache/huggingface/diffusers"
+os.environ["XDG_CACHE_HOME"] = "/app/cache"
+os.environ["TMPDIR"] = "/app/tmp"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
+os.makedirs("/app/cache", exist_ok=True)
+os.makedirs("/app/tmp", exist_ok=True)
+
+import base64
+import io
+import re
+import requests
+import runpod
+import torch
+from PIL import Image
+
+# Turbo checkpoint: 8-step distilled schedule embedded in the checkpoint.
+MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1-Turbo")
+_DEFAULT_STEPS = 8          # turbo default; num_inference_steps is ignored by the saved schedule
+_DEFAULT_CFG = 1.0          # turbo default: CFG=1 -> single forward pass per step
+_MAX_IMAGES = 10
+
+_pipe = None
+
+
+def _load_pipe():
+    global _pipe
+    if _pipe is None:
+        from diffusers import QwenImage21Pipeline
+
+        pipe = QwenImage21Pipeline.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            cache_dir="/app/cache",
+        )
+
+        try:
+            pipe.enable_model_cpu_offload()
+        except Exception as e:
+            print(f"enable_model_cpu_offload failed ({e}), falling back to pipe.to('cuda')")
+            try:
+                pipe.to("cuda")
+            except Exception as e2:
+                print(f"pipe.to('cuda') fallback error: {e2}")
+
+        # VAE tiling & slicing to prevent OOM during VAE decode
+        if hasattr(pipe, "enable_vae_tiling"):
+            pipe.enable_vae_tiling()
+        elif hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+
+        if hasattr(pipe, "enable_vae_slicing"):
+            pipe.enable_vae_slicing()
+        elif hasattr(pipe.vae, "enable_slicing"):
+            pipe.vae.enable_slicing()
+
+        _pipe = pipe
+    return _pipe
+
+
+def _decode_image(src):
+    if isinstance(src, dict):
+        return _decode_image(src.get("image") or src.get("url") or src.get("base64"))
+    if not isinstance(src, str):
+        raise ValueError("image must be base64, data URI, or URL")
+    if re.match(r"^https?://", src):
+        resp = requests.get(src, timeout=120)
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    if src.startswith("data:"):
+        src = src.split(",", 1)[1]
+    return Image.open(io.BytesIO(base64.b64decode(src))).convert("RGB")
+
+
+def _to_b64(img, fmt):
+    buf = io.BytesIO()
+    img.save(buf, format=fmt.upper())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _as_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def handler(job):
+    job_input = job.get("input") or {}
+    prompt = (job_input.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("'prompt' is required")
+
+    pipe = _load_pipe()
+    try:
+        pipe.enable_model_cpu_offload()
+    except Exception:
+        pass
+
+    torch.cuda.empty_cache()
+
+    images_raw = list(job_input.get("images") or [])
+    if job_input.get("image"):
+        images_raw.insert(0, job_input["image"])
+    images = [_decode_image(i) for i in images_raw[:_MAX_IMAGES]]
+
+    # Turbo: the 8-step schedule is baked into the checkpoint. We still pass a step
+    # count for API compatibility, but the saved sigmas win unless a caller sends
+    # explicit sigmas (unsupported here).
+    kwargs = {
+        "prompt": prompt,
+        "num_inference_steps": _as_int(job_input.get("steps"), _DEFAULT_STEPS),
+        "use_kv_cache": True,
+    }
+    if job_input.get("negative_prompt"):
+        kwargs["negative_prompt"] = str(job_input["negative_prompt"])
+    if job_input.get("guidance_scale"):
+        kwargs["true_cfg_scale"] = float(job_input["guidance_scale"])
+    elif job_input.get("true_cfg_scale"):
+        kwargs["true_cfg_scale"] = float(job_input["true_cfg_scale"])
+    else:
+        kwargs["true_cfg_scale"] = _DEFAULT_CFG
+
+    seed = job_input.get("seed")
+    if seed is not None:
+        kwargs["generator"] = torch.Generator("cuda").manual_seed(_as_int(seed, 0))
+
+    if images:
+        kwargs["image"] = images[0] if len(images) == 1 else images
+        if job_input.get("width") and job_input.get("height"):
+            kwargs["width"] = _as_int(job_input["width"], images[0].width)
+            kwargs["height"] = _as_int(job_input["height"], images[0].height)
+    else:
+        kwargs["width"] = _as_int(job_input.get("width"), 1024)
+        kwargs["height"] = _as_int(job_input.get("height"), 1024)
+
+    out = pipe(**kwargs).images[0]
+
+    fmt = (job_input.get("output_format") or "png").lower()
+    if fmt not in ("png", "jpeg", "webp"):
+        fmt = "png"
+    return {"image": _to_b64(out, fmt), "format": fmt, "model": MODEL_ID, "steps": kwargs["num_inference_steps"]}
+
+
+runpod.serverless.start({"handler": handler})
