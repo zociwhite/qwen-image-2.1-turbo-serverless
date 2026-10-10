@@ -41,14 +41,18 @@ def _load_pipe():
             cache_dir="/app/cache",
         )
 
+        # Opsi A: muat SELURUH pipeline ke VRAM (butuh GPU >= 48 GB) supaya tidak ada
+        # swap bobot lewat PCIe tiap step. Fallback ke CPU offload hanya bila VRAM kurang
+        # (mis. GPU 24 GB) — kualitas sama, tapi jauh lebih lambat.
         try:
-            pipe.enable_model_cpu_offload()
+            pipe.to("cuda")
+            print(f"Loaded pipeline fully on GPU (VRAM total {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)")
         except Exception as e:
-            print(f"enable_model_cpu_offload failed ({e}), falling back to pipe.to('cuda')")
+            print(f"pipe.to('cuda') failed ({e}), falling back to enable_model_cpu_offload")
             try:
-                pipe.to("cuda")
+                pipe.enable_model_cpu_offload()
             except Exception as e2:
-                print(f"pipe.to('cuda') fallback error: {e2}")
+                print(f"enable_model_cpu_offload fallback error: {e2}")
 
         # VAE tiling & slicing to prevent OOM during VAE decode
         if hasattr(pipe, "enable_vae_tiling"):
@@ -99,10 +103,6 @@ def handler(job):
         raise ValueError("'prompt' is required")
 
     pipe = _load_pipe()
-    try:
-        pipe.enable_model_cpu_offload()
-    except Exception:
-        pass
 
     torch.cuda.empty_cache()
 
